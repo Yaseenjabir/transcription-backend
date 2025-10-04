@@ -17,6 +17,8 @@ app.get("/", () => console.log("Hello world"));
 
 const server = http.createServer(app);
 
+console.log("Key is : ", process.env.OPENAI_API_KEY);
+
 const wss = new WebSocketServer({
   server,
   path: "/live-transcription",
