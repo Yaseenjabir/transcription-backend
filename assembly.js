@@ -1,272 +1,232 @@
 // assembly.js
+require("dotenv").config();
 const express = require("express");
-const fs = require("fs");
-const FormData = require("form-data");
-const axios = require("axios");
 const cors = require("cors");
 const { WebSocketServer } = require("ws");
+const { AssemblyAI } = require("assemblyai");
 const http = require("http");
 const transcriptionRouter = require("./router/transcriptionRouter");
-require("dotenv").config();
-
+const savingRouter = require("./router/savingRouter");
+const mongoose = require("mongoose");
 const app = express();
 app.use(cors());
+app.use(express.json());
 app.use(transcriptionRouter);
+app.use(savingRouter);
 
-app.get("/", () => console.log("Hello world"));
+const connectDB = async () => {
+  try {
+    const conn = await mongoose.connect(process.env.MONGO_DB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+    });
+    console.log(`MongoDB Connected: ${conn.connection.host}`);
+  } catch (err) {
+    console.error("MongoDB connection error:", err);
+    process.exit(1); // Exit process with failure
+  }
+};
+connectDB();
+
+app.get("/", (req, res) => {
+  return res.json({
+    ASSEMBLY_API_KEY: process.env.ASSEMBLY_API_KEY,
+    MONGO_DB_URI: process.env.MONGO_DB_URI,
+  });
+});
 
 const server = http.createServer(app);
 
-console.log("Key is : ", process.env.OPENAI_API_KEY);
+// Create WebSocket server
+const wss = new WebSocketServer({ server });
 
-const wss = new WebSocketServer({
-  server,
-  path: "/live-transcription",
-});
+// AssemblyAI configuration
+const CONNECTION_PARAMS = {
+  sampleRate: 16000,
+  formatTurns: true,
+  endOfTurnConfidenceThreshold: 0.7,
+  minEndOfTurnSilenceWhenConfident: 160,
+  maxTurnSilence: 2400,
+  keytermsPrompt: [],
+  language: "en",
+};
 
-// -----------------------------
-wss.on("connection", async (ws) => {
-  console.log("Client connected to live transcription");
+wss.on("connection", (clientWs) => {
+  console.log("Client connected to WebSocket server");
 
-  let audioChunks = [];
-  let isProcessing = false;
-  let chunkCounter = 0;
-  let lastAudioReceivedTime = Date.now();
-  let noAudioTimeout = null;
+  let assemblyTranscriber = null;
+  let isAssemblyConnected = false;
+  let audioBuffer = Buffer.alloc(0);
+  const BUFFER_SIZE = 8000; // ~100ms at 16kHz, 16-bit = 32000 bytes/sec
 
-  const CHUNK_DURATION_MS = 2000; // Process every 3 seconds
-  const SAMPLE_RATE = 16000;
-  const BYTES_PER_SAMPLE = 2; // 16-bit PCM
-  const CHUNK_SIZE =
-    ((SAMPLE_RATE * CHUNK_DURATION_MS) / 1000) * BYTES_PER_SAMPLE;
-  const NO_AUDIO_TIMEOUT_MS = 3000; // Close connection after 3 seconds of no audio
-  const SILENCE_THRESHOLD = 0.01; // RMS threshold to detect silence
+  // Initialize AssemblyAI client
+  const client = new AssemblyAI({
+    apiKey: process.env.ASSEMBLY_API_KEY,
+  });
 
-  ws.send(
-    JSON.stringify({
-      status: "connected",
-      message: "Live transcription using Whisper (chunked processing)",
-    })
-  );
+  // Handle messages from client
+  clientWs.on("message", async (message) => {
+    try {
+      const data = JSON.parse(message);
 
-  // Calculate RMS (Root Mean Square) to detect silence
-  const calculateRMS = (buffer) => {
-    let sum = 0;
-    const view = new DataView(
-      buffer.buffer,
-      buffer.byteOffset,
-      buffer.byteLength
-    );
+      // Handle start command
+      if (data.type === "start") {
+        console.log("Starting transcription session");
 
-    for (let i = 0; i < buffer.length; i += 2) {
-      const sample = view.getInt16(i, true) / 32768.0; // Normalize to -1 to 1
-      sum += sample * sample;
-    }
+        // Create transcriber
+        assemblyTranscriber = client.streaming.transcriber(CONNECTION_PARAMS);
 
-    return Math.sqrt(sum / (buffer.length / 2));
-  };
+        // Set up event handlers for AssemblyAI
+        assemblyTranscriber.on("open", ({ id }) => {
+          console.log(`AssemblyAI session opened with ID: ${id}`);
+          isAssemblyConnected = true;
 
-  // Check for no audio timeout
-  const checkNoAudioTimeout = () => {
-    const timeSinceLastAudio = Date.now() - lastAudioReceivedTime;
+          clientWs.send(
+            JSON.stringify({
+              type: "session_opened",
+              sessionId: id,
+            })
+          );
+        });
 
-    if (timeSinceLastAudio >= NO_AUDIO_TIMEOUT_MS) {
-      console.log("No audio received for 3 seconds, closing connection");
-      ws.send(
+        assemblyTranscriber.on("error", (error) => {
+          console.error("AssemblyAI error:", error);
+          clientWs.send(
+            JSON.stringify({
+              type: "error",
+              error: error.message,
+            })
+          );
+        });
+
+        assemblyTranscriber.on("close", (code, reason) => {
+          console.log("AssemblyAI session closed:", code, reason);
+          isAssemblyConnected = false;
+          audioBuffer = Buffer.alloc(0);
+          clientWs.send(
+            JSON.stringify({
+              type: "session_closed",
+              code,
+              reason,
+            })
+          );
+        });
+
+        // Handle partial transcripts (real-time updates)
+        assemblyTranscriber.on("transcript.partial", (transcript) => {
+          clientWs.send(
+            JSON.stringify({
+              type: "transcript.partial",
+              text: transcript.text,
+            })
+          );
+        });
+
+        // Handle final transcripts (complete utterances)
+        assemblyTranscriber.on("transcript.final", (transcript) => {
+          clientWs.send(
+            JSON.stringify({
+              type: "transcript.final",
+              text: transcript.text,
+            })
+          );
+        });
+
+        // Handle turns (when formatTurns is enabled)
+        assemblyTranscriber.on("turn", (turn) => {
+          if (turn.transcript) {
+            clientWs.send(
+              JSON.stringify({
+                type: "turn",
+                text: turn.transcript,
+              })
+            );
+          }
+        });
+
+        // Connect to AssemblyAI
+        await assemblyTranscriber.connect();
+        console.log("Connected to AssemblyAI");
+      } else if (data.type === "stop") {
+        // Handle stop command
+        console.log("Stopping transcription session");
+        isAssemblyConnected = false;
+
+        // Send any remaining buffered audio
+        if (audioBuffer.length > 0 && assemblyTranscriber) {
+          try {
+            assemblyTranscriber.sendAudio(audioBuffer);
+          } catch (err) {
+            console.error("Error sending final audio:", err.message);
+          }
+        }
+
+        audioBuffer = Buffer.alloc(0);
+
+        if (assemblyTranscriber) {
+          await assemblyTranscriber.close();
+          assemblyTranscriber = null;
+        }
+      } else if (data.type === "audio") {
+        // Handle audio data
+        if (data.audio) {
+          // Convert base64 audio to buffer
+          const incomingAudio = Buffer.from(data.audio, "base64");
+
+          // Add to buffer
+          audioBuffer = Buffer.concat([audioBuffer, incomingAudio]);
+
+          // Send buffer when it reaches the minimum size
+          if (
+            audioBuffer.length >= BUFFER_SIZE &&
+            isAssemblyConnected &&
+            assemblyTranscriber
+          ) {
+            try {
+              assemblyTranscriber.sendAudio(audioBuffer);
+              audioBuffer = Buffer.alloc(0); // Clear buffer after sending
+            } catch (err) {
+              console.error("Error sending audio:", err.message);
+              if (err.message.includes("Socket is not open")) {
+                isAssemblyConnected = false;
+              }
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Error processing message:", error);
+      clientWs.send(
         JSON.stringify({
-          status: "timeout",
-          message: "Connection closed due to inactivity",
+          type: "error",
+          error: error.message,
         })
       );
-      ws.close();
-    }
-  };
-
-  // Process audio chunks periodically
-  const processAudioChunk = async () => {
-    if (isProcessing || audioChunks.length === 0) return;
-
-    isProcessing = true;
-
-    try {
-      // Combine all buffered chunks
-      const combinedBuffer = Buffer.concat(audioChunks);
-      audioChunks = [];
-
-      // Check if audio is mostly silence
-      const rms = calculateRMS(combinedBuffer);
-      console.log(`Audio RMS level: ${rms.toFixed(4)}`);
-
-      // Skip processing if audio is silence
-      if (rms < SILENCE_THRESHOLD) {
-        console.log("Detected silence, skipping transcription");
-        isProcessing = false;
-        return;
-      }
-
-      // Save to temporary file
-      const tempFileName = `uploads/temp_audio_${Date.now()}_${chunkCounter++}.wav`;
-
-      // Create WAV file header
-      const wavHeader = createWavHeader(combinedBuffer.length, SAMPLE_RATE);
-      const wavFile = Buffer.concat([wavHeader, combinedBuffer]);
-
-      fs.writeFileSync(tempFileName, wavFile);
-
-      // Send to Whisper API with prompt to reduce hallucinations
-      const formData = new FormData();
-      formData.append("file", fs.createReadStream(tempFileName));
-      formData.append("model", "whisper-1");
-      formData.append("response_format", "json");
-      formData.append("language", "en"); // Specify language to reduce hallucinations
-      // Use a prompt that discourages punctuation
-      formData.append("prompt", "transcribe without punctuation");
-
-      const response = await axios.post(
-        "https://api.openai.com/v1/audio/transcriptions",
-        formData,
-        {
-          headers: {
-            ...formData.getHeaders(),
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          },
-        }
-      );
-
-      // Clean up temp file
-      fs.unlinkSync(tempFileName);
-
-      // Remove all punctuation from the transcribed text
-      let text = response.data.text?.trim() || "";
-
-      // Remove all punctuation marks but keep spaces
-      text = text
-        .replace(/[.,!?;:'"()\[\]{}\-—–]/g, "")
-        .replace(/\s+/g, " ")
-        .trim();
-
-      // Filter out common hallucination patterns (now without punctuation)
-      const hallucinations = [
-        /^(thank you|thanks)$/i,
-        /^you$/i,
-        /MBC 뉴스/i,
-        /チャンネル登録/i,
-        /지금까지/i,
-        /구독/i,
-        /subscribe$/i,
-        /^(uh|um|hmm)$/i,
-      ];
-
-      const isHallucination = hallucinations.some((pattern) =>
-        pattern.test(text)
-      );
-      const isTooShort = text.length < 3;
-      const isRepeated =
-        text.split(" ").length > 3 &&
-        new Set(text.split(" ")).size < text.split(" ").length * 0.5;
-
-      // Send transcription to client only if it's meaningful
-      if (text && !isHallucination && !isTooShort && !isRepeated) {
-        console.log("Sending transcript:", text);
-        ws.send(
-          JSON.stringify({
-            transcript: text,
-            isFinal: true,
-            isTurn: true,
-            timestamp: new Date().toISOString(),
-          })
-        );
-      } else {
-        console.log("Filtered out likely hallucination:", text);
-      }
-    } catch (error) {
-      console.error(
-        "Error processing audio chunk:",
-        error.response?.data || error.message
-      );
-      // Don't send errors for every failed chunk
-    } finally {
-      isProcessing = false;
-    }
-  };
-
-  // Set interval to process chunks
-  const processingInterval = setInterval(processAudioChunk, CHUNK_DURATION_MS);
-
-  // Set interval to check for no audio timeout
-  noAudioTimeout = setInterval(checkNoAudioTimeout, 1000);
-
-  // Handle incoming audio data from frontend
-  ws.on("message", async (data) => {
-    try {
-      if (data instanceof Buffer) {
-        // Update last audio received time
-        lastAudioReceivedTime = Date.now();
-
-        // Buffer the audio data
-        audioChunks.push(data);
-
-        // If buffer gets too large, process immediately
-        const totalSize = audioChunks.reduce(
-          (acc, chunk) => acc + chunk.length,
-          0
-        );
-        if (totalSize >= CHUNK_SIZE * 2) {
-          processAudioChunk();
-        }
-      }
-    } catch (error) {
-      console.error("Error handling audio data:", error);
     }
   });
 
   // Handle client disconnect
-  ws.on("close", async () => {
+  clientWs.on("close", async () => {
     console.log("Client disconnected");
-    clearInterval(processingInterval);
-    clearInterval(noAudioTimeout);
-
-    // Process any remaining meaningful audio
-    if (audioChunks.length > 0) {
-      const combinedBuffer = Buffer.concat(audioChunks);
-      const rms = calculateRMS(combinedBuffer);
-
-      if (rms >= SILENCE_THRESHOLD) {
-        await processAudioChunk();
+    isAssemblyConnected = false;
+    audioBuffer = Buffer.alloc(0);
+    if (assemblyTranscriber) {
+      try {
+        await assemblyTranscriber.close();
+      } catch (err) {
+        console.error("Error closing transcriber:", err.message);
       }
+      assemblyTranscriber = null;
     }
   });
+
+  // Handle errors
+  clientWs.on("error", (error) => {
+    console.error("WebSocket error:", error);
+  });
 });
-
-// Helper function to create WAV header
-function createWavHeader(dataLength, sampleRate) {
-  const header = Buffer.alloc(44);
-
-  // "RIFF" chunk descriptor
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + dataLength, 4);
-  header.write("WAVE", 8);
-
-  // "fmt " sub-chunk
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16); // Subchunk1Size (16 for PCM)
-  header.writeUInt16LE(1, 20); // AudioFormat (1 for PCM)
-  header.writeUInt16LE(1, 22); // NumChannels (1 for mono)
-  header.writeUInt32LE(sampleRate, 24); // SampleRate
-  header.writeUInt32LE(sampleRate * 2, 28); // ByteRate
-  header.writeUInt16LE(2, 32); // BlockAlign
-  header.writeUInt16LE(16, 34); // BitsPerSample
-
-  // "data" sub-chunk
-  header.write("data", 36);
-  header.writeUInt32LE(dataLength, 40);
-
-  return header;
-}
 
 // Start server
 server.listen(3000, () => {
   console.log("Server running on http://localhost:3000");
-  console.log("WebSocket available at ws://localhost:3000/live-transcription");
-  console.log("Using OpenAI Whisper API for transcription");
 });

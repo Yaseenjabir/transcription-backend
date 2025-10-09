@@ -4,9 +4,10 @@ const fs = require("fs");
 const axios = require("axios");
 const path = require("path");
 const multer = require("multer");
-const FormData = require("form-data"); // ✅ import form-data
+const Transcription = require("../models/Transcription");
 require("dotenv").config();
-// console.log(process.env.OPENAI_API_KEY);
+
+const ASSEMBLY_API_KEY = process.env.ASSEMBLY_API_KEY;
 
 // Ensure uploads folder exists
 const uploadDir = path.join(__dirname, "..", "uploads");
@@ -24,56 +25,115 @@ const storage = multer.diskStorage({
   },
 });
 
-const upload = multer({ storage: storage });
-
-// OpenAI API Key
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const upload = multer({ storage });
 
 router.post("/transcribe", upload.single("audio"), async (req, res) => {
-  console.log("Key is : ", OPENAI_API_KEY);
+  if (!req.file) {
+    return res.status(400).json({ error: "No audio file uploaded" });
+  }
+
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No audio file uploaded" });
-    }
+    // Read the audio file as a binary buffer
+    const audioData = fs.readFileSync(req.file.path);
 
-    // Create form data for Whisper API
-    const formData = new FormData();
-    formData.append("file", fs.createReadStream(req.file.path));
-    formData.append("model", "whisper-1");
-    formData.append("language", "en"); // Optional
-    formData.append("response_format", "json"); // json, text, srt, vtt, etc.
-
-    // Call OpenAI Whisper API
-    const response = await axios.post(
-      "https://api.openai.com/v1/audio/transcriptions",
-      formData,
+    // Upload audio to AssemblyAI first
+    const uploadResponse = await axios.post(
+      "https://api.assemblyai.com/v2/upload",
+      audioData,
       {
         headers: {
-          ...formData.getHeaders(),
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          authorization: ASSEMBLY_API_KEY,
+          "content-type": "application/octet-stream",
         },
       }
     );
 
+    const audioUrl = uploadResponse.data.upload_url;
+
+    // Create transcription
+    const transcriptionResponse = await axios.post(
+      "https://api.assemblyai.com/v2/transcript",
+      {
+        audio_url: audioUrl,
+        language_code: "en", // optional
+      },
+      {
+        headers: {
+          authorization: ASSEMBLY_API_KEY,
+          "content-type": "application/json",
+        },
+      }
+    );
+
+    const transcriptId = transcriptionResponse.data.id;
+
+    // Polling for transcript completion
+    let completed = false;
+    let transcriptText = "";
+    while (!completed) {
+      const pollResponse = await axios.get(
+        `https://api.assemblyai.com/v2/transcript/${transcriptId}`,
+        {
+          headers: {
+            authorization: ASSEMBLY_API_KEY,
+          },
+        }
+      );
+
+      if (pollResponse.data.status === "completed") {
+        transcriptText = pollResponse.data.text;
+        completed = true;
+      } else if (pollResponse.data.status === "failed") {
+        throw new Error("AssemblyAI transcription failed");
+      } else {
+        // Wait 1 second before next poll
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+
     // Clean up uploaded file
     fs.unlinkSync(req.file.path);
 
-    // Return transcription
-    return res.json({
-      text: response.data.text,
-      ...(response.data.duration && { duration: response.data.duration }),
-      ...(response.data.language && { language: response.data.language }),
-    });
+    return res.json({ text: transcriptText });
   } catch (err) {
-    console.error("Error transcribing:", err.response?.data || err.message);
+    console.error("Error transcribing:", err.message || err);
 
     if (req.file?.path && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
 
     return res.status(500).json({
-      error: err.response?.data?.error?.message || "Transcription failed",
+      error: err.message || "Transcription failed",
     });
+  }
+});
+
+router.get("/records", async (req, res) => {
+  try {
+    const { category } = req.query;
+
+    // Validate category if provided
+    if (category && !["live", "audio"].includes(category)) {
+      return res.status(400).json({
+        error: "Invalid category. Must be 'live' or 'audio'.",
+      });
+    }
+
+    const filter = category ? { category } : {};
+
+    const transcriptions = await Transcription.find(filter).sort({
+      createdAt: -1,
+    });
+
+    res.status(200).json({
+      count: transcriptions.length,
+      transcriptions,
+    });
+  } catch (err) {
+    console.error("Error fetching transcriptions:", err);
+    res
+      .status(500)
+      .json({ error: "Server error while fetching transcriptions" });
   }
 });
 
