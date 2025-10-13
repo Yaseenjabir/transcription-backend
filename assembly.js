@@ -41,15 +41,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 // AssemblyAI configuration
-const CONNECTION_PARAMS = {
-  sampleRate: 16000,
-  formatTurns: true,
-  endOfTurnConfidenceThreshold: 0.7,
-  minEndOfTurnSilenceWhenConfident: 160,
-  maxTurnSilence: 2400,
-  keytermsPrompt: [],
-  language: "en",
-};
+let CONNECTION_PARAMS = {};
 
 wss.on("connection", (clientWs) => {
   console.log("Client connected to WebSocket server");
@@ -69,11 +61,12 @@ wss.on("connection", (clientWs) => {
     try {
       const data = JSON.parse(message);
 
-      // Handle start command
+      CONNECTION_PARAMS = data.config;
       if (data.type === "start") {
         console.log("Starting transcription session");
 
         // Create transcriber
+        console.log("CONNECTION_PARAMS are:", CONNECTION_PARAMS);
         assemblyTranscriber = client.streaming.transcriber(CONNECTION_PARAMS);
 
         // Set up event handlers for AssemblyAI
@@ -90,7 +83,6 @@ wss.on("connection", (clientWs) => {
         });
 
         assemblyTranscriber.on("error", (error) => {
-          console.error("AssemblyAI error:", error);
           clientWs.send(
             JSON.stringify({
               type: "error",
@@ -100,7 +92,6 @@ wss.on("connection", (clientWs) => {
         });
 
         assemblyTranscriber.on("close", (code, reason) => {
-          console.log("AssemblyAI session closed:", code, reason);
           isAssemblyConnected = false;
           audioBuffer = Buffer.alloc(0);
           clientWs.send(
@@ -112,26 +103,6 @@ wss.on("connection", (clientWs) => {
           );
         });
 
-        // Handle partial transcripts (real-time updates)
-        assemblyTranscriber.on("transcript.partial", (transcript) => {
-          clientWs.send(
-            JSON.stringify({
-              type: "transcript.partial",
-              text: transcript.text,
-            })
-          );
-        });
-
-        // Handle final transcripts (complete utterances)
-        assemblyTranscriber.on("transcript.final", (transcript) => {
-          clientWs.send(
-            JSON.stringify({
-              type: "transcript.final",
-              text: transcript.text,
-            })
-          );
-        });
-
         // Handle turns (when formatTurns is enabled)
         assemblyTranscriber.on("turn", (turn) => {
           if (turn.transcript) {
@@ -139,6 +110,8 @@ wss.on("connection", (clientWs) => {
               JSON.stringify({
                 type: "turn",
                 text: turn.transcript,
+                turn_is_formatted: turn.turn_is_formatted,
+                end_of_turn: turn.end_of_turn,
               })
             );
           }

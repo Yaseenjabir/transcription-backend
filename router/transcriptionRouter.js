@@ -55,7 +55,7 @@ router.post("/transcribe", upload.single("audio"), async (req, res) => {
       "https://api.assemblyai.com/v2/transcript",
       {
         audio_url: audioUrl,
-        language_code: "en", // optional
+        // language_code: "en", // optional
       },
       {
         headers: {
