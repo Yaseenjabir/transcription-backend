@@ -137,4 +137,31 @@ router.get("/records", async (req, res) => {
   }
 });
 
+// GET /getSingleTranscript?id=<_id>
+router.get("/getSingleTranscript", async (req, res) => {
+  try {
+    const { id } = req.query;
+
+    // Validate ID
+    if (!id) {
+      return res.status(400).json({ error: "Transcript ID is required." });
+    }
+
+    // Fetch single transcript by ID
+    const transcript = await Transcription.findById(id);
+
+    if (!transcript) {
+      return res.status(404).json({ error: "Transcript not found." });
+    }
+
+    // Success
+    res.status(200).json({ transcript });
+  } catch (err) {
+    console.error("Error fetching single transcript:", err);
+    res
+      .status(500)
+      .json({ error: "Server error while fetching the transcript." });
+  }
+});
+
 module.exports = router;
