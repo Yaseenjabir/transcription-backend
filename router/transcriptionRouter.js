@@ -5,7 +5,10 @@ const axios = require("axios");
 const path = require("path");
 const multer = require("multer");
 const Transcription = require("../models/Transcription");
+const { default: OpenAI } = require("openai");
 require("dotenv").config();
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const ASSEMBLY_API_KEY = process.env.ASSEMBLY_API_KEY;
 
@@ -137,7 +140,6 @@ router.get("/records", async (req, res) => {
   }
 });
 
-// GET /getSingleTranscript?id=<_id>
 router.get("/getSingleTranscript", async (req, res) => {
   try {
     const { id } = req.query;
@@ -161,6 +163,39 @@ router.get("/getSingleTranscript", async (req, res) => {
     res
       .status(500)
       .json({ error: "Server error while fetching the transcript." });
+  }
+});
+
+router.post("/tts", async (req, res) => {
+  try {
+    const { text, voice = "coral", format = "mp3" } = req.body;
+
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({ error: "Text is required" });
+    }
+
+    const response = await openai.audio.speech.create({
+      model: "gpt-4o-mini-tts",
+      voice,
+      input: text,
+      response_format: format,
+    });
+
+    // Convert to buffer
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    // Set headers to make browser play audio
+    res.set({
+      "Content-Type": `audio/${format}`,
+      "Content-Length": buffer.length,
+      "Content-Disposition": `inline; filename="speech.${format}"`,
+    });
+
+    // Send the audio directly
+    return res.send(buffer);
+  } catch (error) {
+    console.error("TTS Error:", error.message || error);
+    return res.status(500).json({ error: "Text-to-speech failed" });
   }
 });
 
