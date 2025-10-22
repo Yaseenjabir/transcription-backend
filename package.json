@@ -4,7 +4,8 @@
   "main": "assembly.js",
   "scripts": {
     "start": "node assembly.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon assembly.js",
+    "build": "npm install"
   },
   "keywords": [],
   "author": "",
